@@ -4,3 +4,6 @@ whatsapp.loggraphify-out/
 whatsapp-bridge/store/
 whatsapp-bridge/whatsapp-bridge-bin
 whatsapp-bridge/whatsapp-bridge-bin.bak
+
+whatsapp-bridge/*.bak-*
+whatsapp-bridge/main.go.bak-*

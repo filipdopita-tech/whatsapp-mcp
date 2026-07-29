@@ -773,6 +773,115 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		})
 	})
 
+	// Handler for read-only contact info lookup (IsOnWhatsApp + user info + business profile)
+	http.HandleFunc("/api/contact-info", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var req struct {
+			Phones []string `json:"phones"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "Invalid request format", http.StatusBadRequest)
+			return
+		}
+		type ContactInfoResult struct {
+			Query           string `json:"query"`
+			IsOnWhatsApp    bool   `json:"is_on_whatsapp"`
+			JID             string `json:"jid"`
+			VerifiedName    string `json:"verified_name"`
+			Status          string `json:"status"`
+			BusinessProfile string `json:"business_profile,omitempty"`
+			Note            string `json:"note,omitempty"`
+		}
+		results := []ContactInfoResult{}
+		ctx := context.Background()
+		onWA, err := client.IsOnWhatsApp(ctx, req.Phones)
+		if err != nil {
+			http.Error(w, "IsOnWhatsApp failed: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+		for _, item := range onWA {
+			res := ContactInfoResult{Query: item.Query, IsOnWhatsApp: item.IsIn, JID: item.JID.String()}
+			if item.VerifiedName != nil && item.VerifiedName.Details != nil {
+				res.VerifiedName = item.VerifiedName.Details.GetVerifiedName()
+			}
+			if item.IsIn {
+				if infoMap, e := client.GetUserInfo(ctx, []types.JID{item.JID}); e == nil {
+					if ui, ok := infoMap[item.JID]; ok {
+						res.Status = ui.Status
+						if res.VerifiedName == "" && ui.VerifiedName != nil && ui.VerifiedName.Details != nil {
+							res.VerifiedName = ui.VerifiedName.Details.GetVerifiedName()
+						}
+					}
+				}
+				if bp, e := client.GetBusinessProfile(ctx, item.JID); e == nil && bp != nil {
+					if raw, e2 := json.Marshal(bp); e2 == nil {
+						res.BusinessProfile = string(raw)
+					}
+				}
+			} else {
+				res.Note = "not registered on WhatsApp"
+			}
+			results = append(results, res)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(results)
+	})
+
+	// Handler for read-only profile picture lookup (returns the URL, does not download)
+	http.HandleFunc("/api/profile-picture", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var req struct {
+			Phones  []string `json:"phones"`
+			Preview bool     `json:"preview"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "Invalid request format", http.StatusBadRequest)
+			return
+		}
+		type ProfilePicResult struct {
+			Query string `json:"query"`
+			JID   string `json:"jid"`
+			URL   string `json:"url,omitempty"`
+			ID    string `json:"id,omitempty"`
+			Type  string `json:"type,omitempty"`
+			Note  string `json:"note,omitempty"`
+		}
+		results := []ProfilePicResult{}
+		ctx := context.Background()
+		onWA, err := client.IsOnWhatsApp(ctx, req.Phones)
+		if err != nil {
+			http.Error(w, "IsOnWhatsApp failed: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+		for _, item := range onWA {
+			res := ProfilePicResult{Query: item.Query, JID: item.JID.String()}
+			if !item.IsIn {
+				res.Note = "not registered on WhatsApp"
+				results = append(results, res)
+				continue
+			}
+			info, e := client.GetProfilePictureInfo(ctx, item.JID, &whatsmeow.GetProfilePictureParams{Preview: req.Preview})
+			if e != nil {
+				res.Note = "error: " + e.Error()
+			} else if info == nil {
+				res.Note = "no profile picture visible"
+			} else {
+				res.URL = info.URL
+				res.ID = info.ID
+				res.Type = info.Type
+			}
+			results = append(results, res)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(results)
+	})
+
 	// Start the server
 	serverAddr := fmt.Sprintf("127.0.0.1:%d", port)
 	fmt.Printf("Starting REST API server on %s...\n", serverAddr)
