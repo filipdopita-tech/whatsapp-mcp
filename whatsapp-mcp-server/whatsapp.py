@@ -328,24 +328,38 @@ def list_chats(
         conn = sqlite3.connect(MESSAGES_DB_PATH)
         cursor = conn.cursor()
         
-        # Build base query
-        query_parts = ["""
-            SELECT 
-                chats.jid,
-                chats.name,
-                chats.last_message_time,
+        # Sloupce z `messages` smí SELECT jmenovat jen tehdy, když se tabulka
+        # skutečně joinuje. Bez téhle podmínky se při include_last_message=False
+        # dotazovalo na tabulku mimo FROM, SQLite vrátilo "no such column:
+        # messages.content", except níž chybu spolkl a funkce vrátila prázdný
+        # seznam. Volající tak viděl "žádné chaty" místo rozbitého dotazu.
+        # NULL placeholdery drží šířku řádku na 6, protože rozbalení níž je
+        # poziční (chat_data[0..5]).
+        if include_last_message:
+            last_message_cols = """,
                 messages.content as last_message,
                 messages.sender as last_sender,
-                messages.is_from_me as last_is_from_me
+                messages.is_from_me as last_is_from_me"""
+        else:
+            last_message_cols = """,
+                NULL as last_message,
+                NULL as last_sender,
+                NULL as last_is_from_me"""
+
+        query_parts = [f"""
+            SELECT
+                chats.jid,
+                chats.name,
+                chats.last_message_time{last_message_cols}
             FROM chats
         """]
-        
+
         if include_last_message:
             query_parts.append("""
-                LEFT JOIN messages ON chats.jid = messages.chat_jid 
+                LEFT JOIN messages ON chats.jid = messages.chat_jid
                 AND chats.last_message_time = messages.timestamp
             """)
-            
+
         where_clauses = []
         params = []
         

@@ -7,3 +7,6 @@ whatsapp-bridge/whatsapp-bridge-bin.bak
 
 whatsapp-bridge/*.bak-*
 whatsapp-bridge/main.go.bak-*
+
+# runtime log bridge (nesledovat)
+whatsapp-bridge/*.log
