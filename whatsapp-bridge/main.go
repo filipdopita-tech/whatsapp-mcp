@@ -30,6 +30,15 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
+const (
+	// Strop exponencialniho backoffu pri pripojovani. Vyssi hodnota by na
+	// kratkem vypadku site zbytecne prodluzovala okno, ve kterem nesbirame zpravy.
+	connectMaxBackoff = 60 * time.Second
+	// Jak dlouho cekat, nez se spojeni ustali, nez to vzdame a spolehneme se
+	// na interni reconnect whatsmeow.
+	connectStabilizeWait = 30 * time.Second
+)
+
 // Message represents a chat message for our client
 type Message struct {
 	Time      time.Time
@@ -1015,21 +1024,37 @@ func main() {
 			return
 		}
 	} else {
-		// Already logged in, just connect
-		err = client.Connect()
-		if err != nil {
-			logger.Errorf("Failed to connect: %v", err)
-			return
+		// Already logged in. Prvni connect NESMI byt fatalni: na roamingu a
+		// hotelove wifi selhava DNS i TCP handshake bezne, a kazdy takovy pad
+		// znamenal restart pres launchd a 45s okno, ve kterem bridge nesbiral
+		// zpravy. Doloženo: 999 padu mezi 3. a 11. 8. 2026 a 1086 zprav, ktere
+		// se do DB nikdy nedostaly. Proto se pripojeni zkousi dokola s backoffem.
+		backoff := 5 * time.Second
+		for attempt := 1; ; attempt++ {
+			err = client.Connect()
+			if err == nil {
+				break
+			}
+			logger.Warnf("Connect attempt %d failed: %v — retry in %s", attempt, err, backoff)
+			time.Sleep(backoff)
+			if backoff < connectMaxBackoff {
+				backoff *= 2
+				if backoff > connectMaxBackoff {
+					backoff = connectMaxBackoff
+				}
+			}
 		}
 		connected <- true
 	}
 
-	// Wait a moment for connection to stabilize
-	time.Sleep(2 * time.Second)
+	// Pockej, az se spojeni ustali. Puvodne to byl jeden 2s sleep a tvrdy exit,
+	// coz na pomale siti padalo i kdyz se spojeni o vterinu pozdeji navazalo.
+	for waited := time.Duration(0); !client.IsConnected() && waited < connectStabilizeWait; waited += time.Second {
+		time.Sleep(time.Second)
+	}
 
 	if !client.IsConnected() {
-		logger.Errorf("Failed to establish stable connection")
-		return
+		logger.Warnf("Connection not stable yet, continuing anyway — whatsmeow se dopoji sam")
 	}
 
 	fmt.Println("\n✓ Connected to WhatsApp! Type 'help' for commands.")
