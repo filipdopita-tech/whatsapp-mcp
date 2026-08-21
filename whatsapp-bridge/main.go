@@ -211,9 +211,11 @@ type SendMessageRequest struct {
 }
 
 // Function to send a WhatsApp message
-func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message string, mediaPath string) (bool, string) {
+// Vraci navic JID prijemce a ID odeslane zpravy, aby ji voajici mohl ulozit do DB.
+// Bez toho odchozi zpravy poslane pres API v messages.db chybely a nesly overit.
+func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message string, mediaPath string) (bool, string, types.JID, string) {
 	if !client.IsConnected() {
-		return false, "Not connected to WhatsApp"
+		return false, "Not connected to WhatsApp", types.JID{}, ""
 	}
 
 	// Create JID for recipient
@@ -227,7 +229,7 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 		// Parse the JID string
 		recipientJID, err = types.ParseJID(recipient)
 		if err != nil {
-			return false, fmt.Sprintf("Error parsing JID: %v", err)
+			return false, fmt.Sprintf("Error parsing JID: %v", err), types.JID{}, ""
 		}
 	} else {
 		// Create JID from phone number
@@ -244,7 +246,7 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 		// Read media file
 		mediaData, err := os.ReadFile(mediaPath)
 		if err != nil {
-			return false, fmt.Sprintf("Error reading media file: %v", err)
+			return false, fmt.Sprintf("Error reading media file: %v", err), types.JID{}, ""
 		}
 
 		// Determine media type and mime type based on file extension
@@ -293,7 +295,7 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 		// Upload media to WhatsApp servers
 		resp, err := client.Upload(context.Background(), mediaData, mediaType)
 		if err != nil {
-			return false, fmt.Sprintf("Error uploading media: %v", err)
+			return false, fmt.Sprintf("Error uploading media: %v", err), types.JID{}, ""
 		}
 
 		fmt.Println("Media uploaded", resp)
@@ -323,7 +325,7 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 					seconds = analyzedSeconds
 					waveform = analyzedWaveform
 				} else {
-					return false, fmt.Sprintf("Failed to analyze Ogg Opus file: %v", err)
+					return false, fmt.Sprintf("Failed to analyze Ogg Opus file: %v", err), types.JID{}, ""
 				}
 			} else {
 				fmt.Printf("Not an Ogg Opus file: %s\n", mimeType)
@@ -353,8 +355,12 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 				FileLength:    &resp.FileLength,
 			}
 		case whatsmeow.MediaDocument:
+			// FileName je to, co WhatsApp vypisuje pod ikonou dokumentu; bez nej
+			// prijemce vidi "Bez nazvu" (Title sam nestaci, overeno 21. 8. 2026).
+			docName := mediaPath[strings.LastIndex(mediaPath, "/")+1:]
 			msg.DocumentMessage = &waProto.DocumentMessage{
-				Title:         proto.String(mediaPath[strings.LastIndex(mediaPath, "/")+1:]),
+				FileName:      proto.String(docName),
+				Title:         proto.String(docName),
 				Caption:       proto.String(message),
 				Mimetype:      proto.String(mimeType),
 				URL:           &resp.URL,
@@ -370,13 +376,14 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 	}
 
 	// Send message
-	_, err = client.SendMessage(context.Background(), recipientJID, msg)
+	sendResp, err := client.SendMessage(context.Background(), recipientJID, msg)
+	sentID := sendResp.ID
 
 	if err != nil {
-		return false, fmt.Sprintf("Error sending message: %v", err)
+		return false, fmt.Sprintf("Error sending message: %v", err), types.JID{}, ""
 	}
 
-	return true, fmt.Sprintf("Message sent to %s", recipient)
+	return true, fmt.Sprintf("Message sent to %s", recipient), recipientJID, sentID
 }
 
 // Extract media info from a message
@@ -714,8 +721,31 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		fmt.Println("Received request to send message", req.Message, req.MediaPath)
 
 		// Send the message
-		success, message := sendWhatsAppMessage(client, req.Recipient, req.Message, req.MediaPath)
+		success, message, recipientJID, sentID := sendWhatsAppMessage(client, req.Recipient, req.Message, req.MediaPath)
 		fmt.Println("Message sent", success, message)
+
+		// Ulozit odchozi zpravu do DB. Bez toho existuje jen v logu a v telefonu:
+		// handleMessage vidi prichozi udalosti, vlastni odeslani pres API ne, takze
+		// "zkontroluj v messages.db, jestli to odeslo" vracelo prazdno i po uspechu.
+		if success && sentID != "" {
+			mediaType, filename := "", ""
+			if req.MediaPath != "" {
+				filename = req.MediaPath[strings.LastIndex(req.MediaPath, "/")+1:]
+				mediaType = "document"
+				switch strings.ToLower(filepath.Ext(filename)) {
+				case ".jpg", ".jpeg", ".png", ".gif", ".webp":
+					mediaType = "image"
+				case ".ogg":
+					mediaType = "audio"
+				case ".mp4", ".avi", ".mov":
+					mediaType = "video"
+				}
+			}
+			if err := messageStore.StoreMessage(sentID, recipientJID.String(), "", req.Message,
+				time.Now(), true, mediaType, filename, "", nil, nil, nil, 0); err != nil {
+				fmt.Println("Varovani: odeslanou zpravu se nepodarilo ulozit do DB:", err)
+			}
+		}
 		// Set response headers
 		w.Header().Set("Content-Type", "application/json")
 
