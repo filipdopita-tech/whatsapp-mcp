@@ -386,27 +386,54 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 	return true, fmt.Sprintf("Message sent to %s", recipient), recipientJID, sentID
 }
 
-// Extract media info from a message
-func extractMediaInfo(msg *waProto.Message) (mediaType string, filename string, url string, mediaKey []byte, fileSHA256 []byte, fileEncSHA256 []byte, fileLength uint64) {
+// sanitizeMessageID prevede WhatsApp message ID na bezpecny fragment nazvu
+// souboru: povoluje jen [A-Za-z0-9_-], vse ostatni nahrazuje "_" (nemaze,
+// aby se dve ruzna ID nesloucila na stejny retezec). Prazdny vstup vraci "".
+func sanitizeMessageID(id string) string {
+	if id == "" {
+		return ""
+	}
+	var b strings.Builder
+	for _, r := range id {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '_', r == '-':
+			b.WriteRune(r)
+		default:
+			b.WriteRune('_')
+		}
+	}
+	return b.String()
+}
+
+// Extract media info from a message. msgID (WhatsApp message ID) se pripoji
+// ke generovanym nazvum (image/video/audio a document bez FileName), aby dve
+// media zpracovana ve stejne sekunde nedostala stejny "filename" ve store
+// souboru message_id je uz sam o sobe unikatni per zprava.
+func extractMediaInfo(msg *waProto.Message, msgID string) (mediaType string, filename string, url string, mediaKey []byte, fileSHA256 []byte, fileEncSHA256 []byte, fileLength uint64) {
 	if msg == nil {
 		return "", "", "", nil, nil, nil, 0
 	}
 
+	idSuffix := ""
+	if safeID := sanitizeMessageID(msgID); safeID != "" {
+		idSuffix = "_" + safeID
+	}
+
 	// Check for image message
 	if img := msg.GetImageMessage(); img != nil {
-		return "image", "image_" + time.Now().Format("20060102_150405") + ".jpg",
+		return "image", "image_" + time.Now().Format("20060102_150405") + idSuffix + ".jpg",
 			img.GetURL(), img.GetMediaKey(), img.GetFileSHA256(), img.GetFileEncSHA256(), img.GetFileLength()
 	}
 
 	// Check for video message
 	if vid := msg.GetVideoMessage(); vid != nil {
-		return "video", "video_" + time.Now().Format("20060102_150405") + ".mp4",
+		return "video", "video_" + time.Now().Format("20060102_150405") + idSuffix + ".mp4",
 			vid.GetURL(), vid.GetMediaKey(), vid.GetFileSHA256(), vid.GetFileEncSHA256(), vid.GetFileLength()
 	}
 
 	// Check for audio message
 	if aud := msg.GetAudioMessage(); aud != nil {
-		return "audio", "audio_" + time.Now().Format("20060102_150405") + ".ogg",
+		return "audio", "audio_" + time.Now().Format("20060102_150405") + idSuffix + ".ogg",
 			aud.GetURL(), aud.GetMediaKey(), aud.GetFileSHA256(), aud.GetFileEncSHA256(), aud.GetFileLength()
 	}
 
@@ -414,7 +441,7 @@ func extractMediaInfo(msg *waProto.Message) (mediaType string, filename string, 
 	if doc := msg.GetDocumentMessage(); doc != nil {
 		filename := doc.GetFileName()
 		if filename == "" {
-			filename = "document_" + time.Now().Format("20060102_150405")
+			filename = "document_" + time.Now().Format("20060102_150405") + idSuffix
 		}
 		return "document", filename,
 			doc.GetURL(), doc.GetMediaKey(), doc.GetFileSHA256(), doc.GetFileEncSHA256(), doc.GetFileLength()
@@ -442,7 +469,7 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 	content := extractTextContent(msg.Message)
 
 	// Extract media info
-	mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength := extractMediaInfo(msg.Message)
+	mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength := extractMediaInfo(msg.Message, msg.Info.ID)
 
 	// Skip if there's no content and no media
 	if content == "" && mediaType == "" {
@@ -605,8 +632,16 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 		return false, "", "", "", fmt.Errorf("failed to create chat directory: %v", err)
 	}
 
-	// Generate a local path for the file
-	localPath = fmt.Sprintf("%s/%s", chatDir, filename)
+	// Generate a local path for the file. Prefixujeme sanitizovanym message ID,
+	// aby dve media zpracovana ve stejnou sekundu (stejny generovany filename)
+	// nekolidovala na jednom souboru - message ID je uz samo o sobe unikatni
+	// per radek v DB, takze tohle opravi i existujici kolizni radky bez
+	// jakekoli migrace dat (cesta se jen prepocita pri kazdem stazeni).
+	localFilename := filename
+	if safeID := sanitizeMessageID(messageID); safeID != "" {
+		localFilename = safeID + "_" + filename
+	}
+	localPath = fmt.Sprintf("%s/%s", chatDir, localFilename)
 
 	// Get absolute path
 	absPath, err := filepath.Abs(localPath)
@@ -617,7 +652,7 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 	// Check if file already exists
 	if _, err := os.Stat(localPath); err == nil {
 		// File exists, return it
-		return true, mediaType, filename, absPath, nil
+		return true, mediaType, localFilename, absPath, nil
 	}
 
 	// If we don't have all the media info we need, we can't download
@@ -667,7 +702,7 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 	}
 
 	fmt.Printf("Successfully downloaded %s media to %s (%d bytes)\n", mediaType, absPath, len(mediaData))
-	return true, mediaType, filename, absPath, nil
+	return true, mediaType, localFilename, absPath, nil
 }
 
 // Extract direct path from a WhatsApp media URL
@@ -1247,13 +1282,20 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 					}
 				}
 
+				// Message ID (potreba uz pro extractMediaInfo, aby generovane
+				// nazvy medii mohly nest unikatni suffix)
+				msgID := ""
+				if msg.Message.Key != nil && msg.Message.Key.ID != nil {
+					msgID = *msg.Message.Key.ID
+				}
+
 				// Extract media info
 				var mediaType, filename, url string
 				var mediaKey, fileSHA256, fileEncSHA256 []byte
 				var fileLength uint64
 
 				if msg.Message.Message != nil {
-					mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength = extractMediaInfo(msg.Message.Message)
+					mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength = extractMediaInfo(msg.Message.Message, msgID)
 				}
 
 				// Log the message content for debugging
@@ -1280,12 +1322,6 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 					}
 				} else {
 					sender = jid.User
-				}
-
-				// Store message
-				msgID := ""
-				if msg.Message.Key != nil && msg.Message.Key.ID != nil {
-					msgID = *msg.Message.Key.ID
 				}
 
 				// Get message timestamp
