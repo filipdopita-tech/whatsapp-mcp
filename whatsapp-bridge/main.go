@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
 	"encoding/binary"
 	"encoding/json"
@@ -387,8 +388,11 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 }
 
 // sanitizeMessageID prevede WhatsApp message ID na bezpecny fragment nazvu
-// souboru: povoluje jen [A-Za-z0-9_-], vse ostatni nahrazuje "_" (nemaze,
-// aby se dve ruzna ID nesloucila na stejny retezec). Prazdny vstup vraci "".
+// souboru: povoluje jen [A-Za-z0-9_-], vse ostatni nahrazuje "_". Substituce
+// neni obecne injektivni (dve ruzna ID s ruznymi nepovolenymi znaky by se
+// teoreticky mohla sloucit na stejny retezec), v praxi ale WA message ID
+// maji pevny hex-like format bez znaku mimo tuto sadu, takze ke kolizi
+// nedochazi. Prazdny vstup vraci "".
 func sanitizeMessageID(id string) string {
 	if id == "" {
 		return ""
@@ -403,6 +407,21 @@ func sanitizeMessageID(id string) string {
 		}
 	}
 	return b.String()
+}
+
+// sanitizeDocFileName vrati bezpecny zakladni nazev souboru z hodnoty, kterou
+// posila odesilatel (DocumentMessage.FileName je nedoveryhodny vstup - muze
+// obsahovat "../" nebo absolutni cestu). filepath.Base odstrani adresarovou
+// cast; vysledky "", ".", ".." nebo "/" (prazdny/koren/rodic po ocisteni)
+// jsou zamitnuty, volajici pak pouzije generovany nahradni nazev.
+func sanitizeDocFileName(name string) string {
+	base := filepath.Base(name)
+	switch base {
+	case "", ".", "..", "/":
+		return ""
+	default:
+		return base
+	}
 }
 
 // Extract media info from a message. msgID (WhatsApp message ID) se pripoji
@@ -439,7 +458,7 @@ func extractMediaInfo(msg *waProto.Message, msgID string) (mediaType string, fil
 
 	// Check for document message
 	if doc := msg.GetDocumentMessage(); doc != nil {
-		filename := doc.GetFileName()
+		filename := sanitizeDocFileName(doc.GetFileName())
 		if filename == "" {
 			filename = "document_" + time.Now().Format("20060102_150405") + idSuffix
 		}
@@ -597,6 +616,10 @@ func (d *MediaDownloader) GetMediaType() whatsmeow.MediaType {
 
 // Function to download media from a message
 func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, messageID, chatJID string) (bool, string, string, string, error) {
+	if messageID == "" {
+		return false, "", "", "", fmt.Errorf("empty message id")
+	}
+
 	// Query the database for the message
 	var mediaType, filename, url string
 	var mediaKey, fileSHA256, fileEncSHA256 []byte
@@ -634,14 +657,25 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 
 	// Generate a local path for the file. Prefixujeme sanitizovanym message ID,
 	// aby dve media zpracovana ve stejnou sekundu (stejny generovany filename)
-	// nekolidovala na jednom souboru - message ID je uz samo o sobe unikatni
-	// per radek v DB, takze tohle opravi i existujici kolizni radky bez
-	// jakekoli migrace dat (cesta se jen prepocita pri kazdem stazeni).
-	localFilename := filename
-	if safeID := sanitizeMessageID(messageID); safeID != "" {
-		localFilename = safeID + "_" + filename
-	}
+	// nekolidovala na jednom souboru. Spojeni safeID + "_" + filename neni
+	// obecne prosto kolizi (filename muze sam obsahovat "_"), v praxi ale
+	// WA message ID maji pevny hex-like format, takze ke kolizi s realnymi
+	// daty nedochazi. Message ID je jinak samo o sobe unikatni per radek
+	// v DB, takze tohle opravi i existujici kolizni radky bez jakekoli
+	// migrace dat (cesta se jen prepocita pri kazdem stazeni). messageID je
+	// v tomto miste uz zaruceno neprazdne (viz guard na zacatku funkce),
+	// takze safeID nikdy neni "".
+	safeID := sanitizeMessageID(messageID)
+	localFilename := safeID + "_" + filename
 	localPath = fmt.Sprintf("%s/%s", chatDir, localFilename)
+
+	// filename pochazi z DB a u starsich (predfixovych) radku muze jit o
+	// nesanitizovany nazev dokumentu od odesilatele - overime, ze slozeny
+	// localPath porad zustava uvnitr chatDir a ne mimo nej (path traversal).
+	cleanChatDir := filepath.Clean(chatDir)
+	if !strings.HasPrefix(filepath.Clean(localPath), cleanChatDir+string(os.PathSeparator)) {
+		return false, "", "", "", fmt.Errorf("resolved media path escapes chat directory")
+	}
 
 	// Get absolute path
 	absPath, err := filepath.Abs(localPath)
@@ -653,6 +687,29 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 	if _, err := os.Stat(localPath); err == nil {
 		// File exists, return it
 		return true, mediaType, localFilename, absPath, nil
+	}
+
+	// Legacy cache fallback: pred 705e482 se soubory ukladaly na
+	// chatDir/<filename> bez ID prefixu. Samotny nazev nerika spolehlive,
+	// jestli je radek legacy - dokument s puvodnim nazvem od odesilatele
+	// ID priponu nema nikdy, bez ohledu na verzi kodu, takze podle nazvu
+	// by fallback mohl vratit soubor patrici JINE zprave (to byl puvodni
+	// bug). Misto toho overujeme obsah: fileSHA256 v DB je SHA-256
+	// desifrovanych dat (whatsmeow ho tak pocita pri stazeni), tedy presny
+	// otisk spravneho souboru pro TUTO zpravu. Bez shody hashe fallback
+	// preskocime a soubor se stahne znovu - spravnost ma prednost pred
+	// zasahem do cache.
+	if legacyPath := fmt.Sprintf("%s/%s", chatDir, filename); strings.HasPrefix(filepath.Clean(legacyPath), cleanChatDir+string(os.PathSeparator)) {
+		if info, statErr := os.Stat(legacyPath); statErr == nil && len(fileSHA256) == 32 && uint64(info.Size()) == fileLength {
+			if data, readErr := os.ReadFile(legacyPath); readErr == nil {
+				sum := sha256.Sum256(data)
+				if bytes.Equal(sum[:], fileSHA256) {
+					if legacyAbsPath, absErr := filepath.Abs(legacyPath); absErr == nil {
+						return true, mediaType, filename, legacyAbsPath, nil
+					}
+				}
+			}
+		}
 	}
 
 	// If we don't have all the media info we need, we can't download
