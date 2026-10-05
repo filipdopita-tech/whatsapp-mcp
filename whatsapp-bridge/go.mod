@@ -4,7 +4,7 @@ go 1.26.0
 
 require (
 	github.com/mattn/go-sqlite3 v1.14.52
-	go.mau.fi/whatsmeow v0.0.0-20260929112325-8b41cfe6d9c4
+	go.mau.fi/whatsmeow v0.0.0-20261005123207-68df7a5ec7b5
 	google.golang.org/protobuf v1.36.12
 )
 
@@ -12,13 +12,13 @@ require (
 	filippo.io/edwards25519 v1.2.0 // indirect
 	github.com/beeper/argo-go v1.1.2 // indirect
 	github.com/coder/websocket v1.8.15 // indirect
-	github.com/elliotchance/orderedmap/v3 v3.1.0 // indirect
+	github.com/elliotchance/orderedmap/v3 v3.1.1 // indirect
 	github.com/google/uuid v1.6.0 // indirect
-	github.com/mattn/go-colorable v0.1.14 // indirect
-	github.com/mattn/go-isatty v0.0.22 // indirect
-	github.com/petermattis/goid v0.0.0-20260820044319-269ab09b5261 // indirect
+	github.com/mattn/go-colorable v0.1.15 // indirect
+	github.com/mattn/go-isatty v0.0.24 // indirect
+	github.com/petermattis/goid v0.0.0-20260918085751-abfca077860b // indirect
 	github.com/rs/zerolog v1.35.1 // indirect
-	github.com/vektah/gqlparser/v2 v2.5.33 // indirect
+	github.com/vektah/gqlparser/v2 v2.5.60 // indirect
 	go.mau.fi/libsignal v0.2.2 // indirect
 	go.mau.fi/util v0.10.1 // indirect
 	golang.org/x/crypto v0.57.0 // indirect
